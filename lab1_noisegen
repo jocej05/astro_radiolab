@@ -1,0 +1,18 @@
+import numpy as np
+import ugradio.sdr
+
+fs = 2_000_000            # example: 2 MHz
+N_total = 100_000         # tens of thousands (requirement satisfied)
+
+sdr = ugradio.sdr.SDR(sample_rate=fs)
+sdr.read_samples(4096)    # flush stale buffer (important!)
+data = sdr.read_samples(N_total)
+
+data = data.astype(float)
+
+np.savez(
+    "noise_raw_fs2MHz.npz",
+    data=data,
+    sample_rate=fs
+)
+
