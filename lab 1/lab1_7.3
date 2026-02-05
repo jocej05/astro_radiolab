@@ -58,3 +58,15 @@ np.savez(
 )
 
 print("Saved Channel 2 (Q) IF capture:", x.shape)
+
+
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+t = np.arange(len(x)) / fs
+plt.plot(t[:200], x[:200])
+plt.xlabel("Time (s)")
+plt.ylabel("Voltage (arb)")
+plt.title("Channel 2 IF (delayed LO path)")
+plt.show()
