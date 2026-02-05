@@ -15,3 +15,16 @@ x = sdr.read_samples(N).astype(float)
 np.savez("dsb_IF_RF9p8_LO10_fs1MHz.npz", data=x, sample_rate=fs)
 
 print("saved", x.shape)
+
+
+
+
+import matplotlib.pyplot as plt
+
+t = np.arange(N)/fs
+plt.figure()
+plt.plot(t[:2000], x[:2000])
+plt.xlabel("Time (s)")
+plt.ylabel("Voltage (arb)")
+plt.title("IF time series (should look sinusoidal)")
+plt.show()
