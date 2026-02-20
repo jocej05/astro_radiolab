@@ -1,0 +1,185 @@
+import numpy as np
+import ugradio
+import os
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+############################
+# CONFIGURATION
+############################
+
+HI_FREQ = 1420.405751e6  # Hydrogen rest frequency [Hz]
+c = 299792458            # Speed of light [m/s]
+
+nsamples = 2**14
+nblocks_cal = 8
+nblocks_obs = 128
+gain = 40
+sample_rate = 1e6
+freq_offset = 100e3
+
+T_hot = 300
+T_cold = 10
+
+outdir = "data"
+os.makedirs(outdir, exist_ok=True)
+
+############################
+# HELPER FUNCTION
+############################
+
+def capture(label, center_freq, nblocks):
+    input(f"Aim horn at {label} and press Enter...")
+
+    sdr = ugradio.sdr.SDR(direct=False)
+    sdr.sample_rate = sample_rate
+    sdr.gain = gain
+    sdr.center_freq = center_freq
+
+    result = ugradio.sdr.capture_data(sdr, nsamples=nsamples, nblocks=nblocks)
+
+    # Robust extraction
+    if isinstance(result, dict):
+        if "data" in result:
+            voltages = np.array(result["data"], dtype=np.complex64).flatten()
+        elif "samples" in result:
+            voltages = np.array(result["samples"], dtype=np.complex64).flatten()
+        else:
+            first_array = next(v for v in result.values() if isinstance(v, (list, np.ndarray)))
+            voltages = np.array(first_array, dtype=np.complex64).flatten()
+    else:
+        voltages = np.array(result, dtype=np.complex64).flatten()
+
+    fft = np.fft.fftshift(np.fft.fft(voltages))
+    power = np.abs(fft)**2
+
+    print(f"{label} capture complete. Data length: {len(voltages)}")
+    sdr.close()
+    return voltages, power
+
+############################
+# 1 Cold Sky
+############################
+
+data_cold, spec_cold = capture("COLD SKY", HI_FREQ, nblocks_cal)
+
+############################
+# 2 Hot Load
+############################
+
+data_hot, spec_hot = capture("HOT LOAD", HI_FREQ, nblocks_cal)
+
+P_cold = np.mean(spec_cold)
+P_hot = np.mean(spec_hot)
+Y = P_hot / P_cold
+T_sys = (T_hot - Y*T_cold) / (Y - 1)
+
+print(f"Y-factor: {Y:.4f}")
+print(f"Estimated system temperature: {T_sys:.2f} K")
+
+############################
+# 3 Frequency Switching Observation
+############################
+
+upper_blocks_volt = []
+upper_blocks_power = []
+lower_blocks_volt = []
+lower_blocks_power = []
+
+sdr = ugradio.sdr.SDR(direct=False)
+sdr.sample_rate = sample_rate
+sdr.gain = gain
+
+input("Aim horn at HI target and press Enter...")  # <-- FIXED (no label here)
+
+for i in range(nblocks_obs):
+
+    if i % 2 == 0:
+        sdr.center_freq = HI_FREQ - freq_offset
+        print(f"Upper LO block {i+1}")
+    else:
+        sdr.center_freq = HI_FREQ + freq_offset
+        print(f"Lower LO block {i+1}")
+
+    result = ugradio.sdr.capture_data(sdr, nsamples=nsamples, nblocks=1)
+
+    # Robust extraction again
+    if isinstance(result, dict):
+        if "data" in result:
+            voltages = np.array(result["data"], dtype=np.complex64).flatten()
+        elif "samples" in result:
+            voltages = np.array(result["samples"], dtype=np.complex64).flatten()
+        else:
+            first_array = next(v for v in result.values() if isinstance(v, (list, np.ndarray)))
+            voltages = np.array(first_array, dtype=np.complex64).flatten()
+    else:
+        voltages = np.array(result, dtype=np.complex64).flatten()
+
+    fft = np.fft.fftshift(np.fft.fft(voltages))
+    power = np.abs(fft)**2
+
+    if i % 2 == 0:
+        upper_blocks_volt.append(voltages)
+        upper_blocks_power.append(power)
+    else:
+        lower_blocks_volt.append(voltages)
+        lower_blocks_power.append(power)
+
+sdr.close()
+
+############################
+# Stack Spectra
+############################
+
+upper_blocks_power = np.array(upper_blocks_power)
+lower_blocks_power = np.array(lower_blocks_power)
+
+spec_upper_avg = np.mean(upper_blocks_power, axis=0)
+spec_lower_avg = np.mean(lower_blocks_power, axis=0)
+
+len_fft = len(spec_upper_avg)
+freqs = np.fft.fftshift(np.fft.fftfreq(len_fft, d=1/sample_rate))
+
+rf_upper = freqs + (HI_FREQ - freq_offset)
+rf_lower = freqs + (HI_FREQ + freq_offset)
+
+interp_lower = interp1d(rf_lower, spec_lower_avg, bounds_error=False, fill_value=0)
+spec_lower_on_upper = interp_lower(rf_upper)
+
+diff_spec_stack = spec_upper_avg - spec_lower_on_upper
+
+T_ant = T_sys * (diff_spec_stack / P_cold)
+
+velocity = c * (HI_FREQ - rf_upper) / HI_FREQ / 1000
+
+############################
+# Save
+############################
+
+np.savez(os.path.join(outdir, "hi_21cm_final_sdr_freqswitch.npz"),
+         freq_Hz=rf_upper,
+         velocity_kms=velocity,
+         temperature_K=T_ant,
+         s_cold=spec_cold,
+         s_hot=spec_hot,
+         upper_volt=upper_blocks_volt,
+         lower_volt=lower_blocks_volt,
+         spec_upper_avg=spec_upper_avg,
+         spec_lower_avg=spec_lower_avg,
+         diff_spec=diff_spec_stack,
+         T_sys_K=T_sys,
+         Y_factor=Y)
+
+print("Frequency-switched observation complete and saved.")
+
+############################
+# Plot
+############################
+
+plt.figure(figsize=(10,5))
+plt.plot(velocity, T_ant)
+plt.xlabel("Velocity (km/s)")
+plt.ylabel("Antenna Temperature (K)")
+plt.title("21-cm HI Spectrum (Frequency-Switched)")
+plt.grid(True)
+plt.show()
