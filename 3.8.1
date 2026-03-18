@@ -67,39 +67,49 @@ stop_event  = threading.Event()
 # ---------------------------------------------------------------------------
 
 def collect_data(spec):
+    """
+    Background thread: reads visibility spectra from the SNAP correlator,
+    skipping duplicate integrations by comparing acc_cnt.
+    Runs until stop_event is set.
+    """
     print("[collector] Starting data collection thread.")
     prev_acc_cnt = None
     first_read   = True
 
     while not stop_event.is_set():
-        data = spec.read_data()
+        try:
+            data = spec.read_data()
 
-        if first_read:
-            print(f"[collector] read_data() keys: {list(data.keys())}")
-            first_read = False
+            # On the very first read, print keys so we can verify field names
+            if first_read:
+                print(f"[collector] read_data() keys: {list(data.keys())}")
+                first_read = False
 
-        acc_cnt = data.get("acc_cnt", None)
-        if acc_cnt is not None and acc_cnt == prev_acc_cnt:
-            time.sleep(0.05)
+            # Skip if this is the same integration we already saved
+            acc_cnt = data.get("acc_cnt", None)
+            if acc_cnt is not None and acc_cnt == prev_acc_cnt:
+                time.sleep(0.05)
+                continue
+            prev_acc_cnt = acc_cnt
+
+            jd_now = ugradio.timing.julian_date()
+
+            # 'corr01' confirmed as the correct key from SNAP output
+            vis_spectrum = data["corr01"]
+
+            with buffer_lock:
+                data_buffer["vis"].append(vis_spectrum)
+                data_buffer["times"].append(jd_now)
+                data_buffer["alt_az"].append(current_altaz)
+
+        except AssertionError:
+            # SNAP integration advanced mid-read — harmless, just retry
             continue
-        prev_acc_cnt = acc_cnt
+        except Exception as e:
+            print(f"[collector] Unexpected error: {e}")
+            raise
 
-        jd_now = ugradio.timing.julian_date()
-
-        if "cross" in data:
-            vis_spectrum = data["cross"]
-        elif "corr" in data:
-            vis_spectrum = data["corr"]
-        else:
-            vis_spectrum = next(
-                v for v in data.values()
-                if isinstance(v, np.ndarray) and np.iscomplexobj(v)
-            )
-
-        with buffer_lock:
-            data_buffer["vis"].append(vis_spectrum)
-            data_buffer["times"].append(jd_now)
-            data_buffer["alt_az"].append(current_altaz)
+    print("[collector] Stopping.")
 
 # ---------------------------------------------------------------------------
 # Pointing helper
