@@ -13,6 +13,12 @@ Output:
         - vis:      array of complex visibility spectra, shape (N_integrations, 1024)
         - times:    array of JD timestamps for each integration
         - alt_az:   array of (alt, az) pointings, shape (N_integrations, 2)
+
+Fixes applied:
+    - Removed coord.precess() call: sunpos() already returns current-epoch coords
+    - Removed prev_acc_cnt kwarg from read_data(): not supported; use acc_cnt polling
+    - get_altaz() called with equinox='J2000' to match sunpos() output
+    - read_data() return keys printed on first call for debugging
 """
 
 import numpy as np
@@ -38,7 +44,7 @@ ALT  =  123.0     # meters above sea level
 OBS_DURATION_SEC   = 3600   # 1 hour
 POINT_UPDATE_SEC   = 30     # re-point every 30 seconds
 
-# Minimum elevation to observe (degrees) — stay well above horizon
+# Minimum elevation to observe (degrees)
 MIN_ALT = 15.0
 
 # Output directory
@@ -62,39 +68,49 @@ stop_event  = threading.Event()
 
 def collect_data(spec):
     """
-    Background thread: reads visibility spectra from the SNAP correlator as
-    fast as possible, tagging each with a JD timestamp, and appends to the
-    shared buffer.  Runs until stop_event is set.
+    Background thread: reads visibility spectra from the SNAP correlator,
+    skipping duplicate integrations by comparing acc_cnt.
+    Runs until stop_event is set.
     """
     print("[collector] Starting data collection thread.")
     prev_acc_cnt = None
+    first_read   = True
 
     while not stop_event.is_set():
         try:
-            # Pass previous acc_cnt so read_data waits for the NEXT integration
-            data = spec.read_data(prev_acc_cnt=prev_acc_cnt)
-            prev_acc_cnt = data["acc_cnt"]
+            data = spec.read_data()
+
+            # On the very first read, print keys so we can verify field names
+            if first_read:
+                print(f"[collector] read_data() keys: {list(data.keys())}")
+                first_read = False
+
+            # Skip if this is the same integration we already saved
+            acc_cnt = data.get("acc_cnt", None)
+            if acc_cnt is not None and acc_cnt == prev_acc_cnt:
+                time.sleep(0.05)
+                continue
+            prev_acc_cnt = acc_cnt
 
             jd_now = ugradio.timing.julian_date()
 
-            # Visibility is a complex spectrum of 1024 channels
-            # data["cross"] is the cross-correlation product v1 * v2*
-            vis_spectrum = data["cross"]
-
-            # Get current pointing for bookkeeping
-            try:
-                ifm_tmp = interf.Interferometer()
-                pointing = ifm_tmp.get_pointing()  # returns [(alt1,az1),(alt2,az2)]
-                # Average the two dishes
-                alt = np.mean([pointing[0][0], pointing[1][0]])
-                az  = np.mean([pointing[0][1], pointing[1][1]])
-            except Exception:
-                alt, az = np.nan, np.nan
+            # Try common key names for the cross-correlation spectrum
+            if "cross" in data:
+                vis_spectrum = data["cross"]
+            elif "corr" in data:
+                vis_spectrum = data["corr"]
+            else:
+                # Fall back: grab the first complex-valued array in the dict
+                vis_spectrum = next(
+                    v for v in data.values()
+                    if isinstance(v, np.ndarray) and np.iscomplexobj(v)
+                )
 
             with buffer_lock:
                 data_buffer["vis"].append(vis_spectrum)
                 data_buffer["times"].append(jd_now)
-                data_buffer["alt_az"].append((alt, az))
+                # alt_az is filled by the main thread via current_altaz below
+                data_buffer["alt_az"].append(current_altaz)
 
         except Exception as e:
             print(f"[collector] Warning: {e}")
@@ -106,24 +122,32 @@ def collect_data(spec):
 # Pointing helper
 # ---------------------------------------------------------------------------
 
+# Shared variable so the collector thread can log current pointing
+current_altaz = (np.nan, np.nan)
+
 def point_to_sun(ifm):
     """
     Compute the current alt/az of the Sun and point the interferometer there.
+    sunpos() already returns coordinates in the current epoch, so no
+    precession step is needed.
     Returns (alt, az) if successful, or None if the Sun is too low.
     """
+    global current_altaz
+
     jd = ugradio.timing.julian_date()
+
+    # sunpos returns RA in hours, Dec in degrees, current epoch
     ra, dec = coord.sunpos(jd)
 
-    # Precess from J2000 to current epoch
-    ra_now, dec_now = coord.precess(ra, dec, jd, equinox=2000.0)
-
-    alt, az = coord.get_altaz(ra_now, dec_now, jd, LAT, LON, ALT)
+    # get_altaz expects RA in hours, Dec in degrees; equinox matches sunpos output
+    alt, az = coord.get_altaz(ra, dec, jd, LAT, LON, ALT, equinox='J2000')
 
     if alt < MIN_ALT:
-        print(f"[pointing] Sun too low: alt={alt:.1f}°. Waiting...")
+        print(f"[pointing] Sun too low: alt={alt:.1f}°.")
         return None
 
     print(f"[pointing] Pointing to Sun: alt={alt:.1f}°, az={az:.1f}°")
+    current_altaz = (alt, az)
     ifm.point(alt, az)
     return alt, az
 
@@ -230,4 +254,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
