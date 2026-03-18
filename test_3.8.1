@@ -1,0 +1,9 @@
+import ugradio
+from ugradio import coord
+
+jd = ugradio.timing.julian_date()
+ra, dec = coord.sunpos(jd)
+print(f"RA: {ra}, Dec: {dec}")
+
+alt, az = coord.get_altaz(ra, dec, jd, 37.8732, -122.2573, 123.0)
+print(f"Alt: {alt}, Az: {az}")
